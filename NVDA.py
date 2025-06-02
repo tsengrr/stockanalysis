@@ -1,18 +1,20 @@
-import yfinance as yf
+import os
+import json
 import feedparser
+import yfinance as yf
 import pandas as pd
 from textblob import TextBlob
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
-from datetime import datetime, timedelta
-from sklearn.ensemble import GradientBoostingRegressor
+from datetime import datetime
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
 from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.ensemble import RandomForestRegressor
-import requests
-import re
+import plotly.graph_objects as go
+from flask import Flask, render_template_string
+
 
 # 多隻股票分析
 tickers = ["NVDA", "AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", "META"]
@@ -286,3 +288,123 @@ for ticker, results in all_results.items():
 print(f"\n{'='*80}")
 print("分析完成！")
 print(f"{'='*80}")
+
+def make_json_safe(results_dict):
+    safe_dict = {}
+    for ticker, result in results_dict.items():
+        safe_scores = {}
+        for model_name, info in result['model_scores'].items():
+            safe_scores[model_name] = {
+                'train_score': info['train_score'],
+                'test_score': info['test_score']
+            }
+        safe_dict[ticker] = {
+            'current_price': result['current_price'],
+            'model_scores': safe_scores,
+            'predictions': result['predictions'],
+            'latest_features': result['latest_features']
+        }
+    return safe_dict
+
+# 儲存分析結果到 JSON
+safe_results = make_json_safe(all_results)
+with open("stock_results.json", "w") as f:
+    json.dump(safe_results, f)
+
+# ------------------ 啟動 Flask 伺服器 ------------------
+app = Flask(__name__)
+
+def generate_comparison_chart():
+    tickers = []
+    actual_prices = []
+    predicted_prices = []
+    for ticker, results in all_results.items():
+        best_model = max(results['model_scores'].items(), key=lambda x: x[1]['test_score'])
+        tickers.append(ticker)
+        actual_prices.append(results['current_price'])
+        predicted_prices.append(results['predictions'][best_model[0]]['predicted_price'])
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=tickers, y=actual_prices, name='實際價格'))
+    fig.add_trace(go.Bar(x=tickers, y=predicted_prices, name='預測價格'))
+    fig.update_layout(title='股票實際 vs 預測價格', xaxis_title='股票代號', yaxis_title='價格 (USD)', barmode='group')
+    return fig.to_html(full_html=False)
+
+@app.route('/')
+def index():
+    chart_html = generate_comparison_chart()
+    summary_html = ""
+    for ticker, results in all_results.items():
+        best_model = max(results['model_scores'].items(), key=lambda x: x[1]['test_score'])
+        pred = results['predictions'][best_model[0]]
+
+        # 計算平均預測
+        preds = [p['predicted_price'] for p in results['predictions'].values()]
+        avg_pred = sum(preds) / len(preds)
+        avg_change = ((avg_pred - results['current_price']) / results['current_price']) * 100
+
+        summary_html += f"""
+        <h2>{ticker}</h2>
+        <ul>
+            <li>最新一筆價格: ${results['current_price']:.2f}</li>
+            <li>預測價格 ({best_model[0]}): ${pred['predicted_price']:.2f}</li>
+            <li>預期變化: {pred['change_percent']:+.2f}%</li>
+        </ul>
+        """
+
+    html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>股票預測儀表板</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', sans-serif;
+                background-color: #f0f2f5;
+                color: #333;
+                margin: 0;
+                padding: 0;
+            }
+            h1 {
+                background-color: #1f77b4;
+                color: white;
+                padding: 20px;
+                margin: 0;
+                text-align: center;
+            }
+            .container {
+                padding: 20px;
+                max-width: 1000px;
+                margin: auto;
+            }
+            .card {
+                background-color: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                margin-bottom: 20px;
+                padding: 20px;
+            }
+            ul {
+                list-style-type: none;
+                padding-left: 0;
+            }
+            li {
+                margin: 8px 0;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>📈 股票預測儀表板</h1>
+        <div class="container">
+            {{ chart_html | safe }}
+            <hr>
+            {{ summary_html | safe }}
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template, chart_html=chart_html, summary_html=summary_html)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=80)
