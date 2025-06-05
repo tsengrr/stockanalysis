@@ -13,8 +13,8 @@ from sklearn.tree import DecisionTreeRegressor
 from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator
 import plotly.graph_objects as go
-from flask import Flask, render_template_string
-
+from flask import Flask, render_template_string, request
+import numpy as np
 
 # 多隻股票分析
 tickers = ["NVDA", "AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", "META"]
@@ -191,9 +191,9 @@ for ticker in tickers:
         # 訓練模型
         models = {
             'LinearRegression': LinearRegression(),
-            'GradientBoosting': GradientBoostingRegressor(n_estimators=400),
-            'DecisionTree': DecisionTreeRegressor(criterion='squared_error', max_depth=3, random_state=0),
-            'RandomForest': RandomForestRegressor(criterion='squared_error', n_estimators=10, random_state=0, n_jobs=8)
+            'GradientBoosting': GradientBoostingRegressor(n_estimators=400, random_state=42),
+            'DecisionTree': DecisionTreeRegressor(criterion='squared_error', max_depth=3, random_state=42),
+            'RandomForest': RandomForestRegressor(criterion='squared_error', n_estimators=10, random_state=42, n_jobs=8)
         }
         
         model_results = {}
@@ -289,122 +289,219 @@ print(f"\n{'='*80}")
 print("分析完成！")
 print(f"{'='*80}")
 
-def make_json_safe(results_dict):
-    safe_dict = {}
-    for ticker, result in results_dict.items():
-        safe_scores = {}
-        for model_name, info in result['model_scores'].items():
-            safe_scores[model_name] = {
-                'train_score': info['train_score'],
-                'test_score': info['test_score']
-            }
-        safe_dict[ticker] = {
-            'current_price': result['current_price'],
-            'model_scores': safe_scores,
-            'predictions': result['predictions'],
-            'latest_features': result['latest_features']
-        }
-    return safe_dict
-
-# 儲存分析結果到 JSON
-safe_results = make_json_safe(all_results)
-with open("stock_results.json", "w") as f:
-    json.dump(safe_results, f)
-
 # ------------------ 啟動 Flask 伺服器 ------------------
 app = Flask(__name__)
 
-def generate_comparison_chart():
-    tickers = []
-    actual_prices = []
-    predicted_prices = []
-    for ticker, results in all_results.items():
-        best_model = max(results['model_scores'].items(), key=lambda x: x[1]['test_score'])
-        tickers.append(ticker)
-        actual_prices.append(results['current_price'])
-        predicted_prices.append(results['predictions'][best_model[0]]['predicted_price'])
+# 預測未來 n 天價格（高效率）
+def predict_n_days(stock_data, features_df, model, n_days=30):
+    future_predictions = []
+    current_features = features_df.iloc[-1].copy()
 
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=tickers, y=actual_prices, name='實際價格'))
-    fig.add_trace(go.Bar(x=tickers, y=predicted_prices, name='預測價格'))
-    fig.update_layout(title='股票實際 vs 預測價格', xaxis_title='股票代號', yaxis_title='價格 (USD)', barmode='group')
-    return fig.to_html(full_html=False)
+    for _ in range(n_days):
+        X_input = pd.DataFrame([current_features])
+        predicted_price = model.predict(X_input)[0]
+        future_predictions.append(predicted_price)
 
-@app.route('/')
+        close_vals = list(features_df['MA_5_lag'].dropna().values[-4:]) + [predicted_price]
+        current_features['MA_5_lag'] = np.mean(close_vals)
+
+        close_vals = list(features_df['MA_20_lag'].dropna().values[-19:]) + [predicted_price]
+        current_features['MA_20_lag'] = np.mean(close_vals)
+
+        current_features['RSI_lag'] = min(max(current_features['RSI_lag'] + np.random.uniform(-1, 1), 0), 100)
+        current_features['Volume_lag'] = current_features['Volume_lag']
+        current_features['sentiment_lag'] = current_features['sentiment_lag']
+
+    return future_predictions
+
+# 訓練所有模型並返回
+available_models = {
+    'LinearRegression': LinearRegression(),
+    'GradientBoosting': GradientBoostingRegressor(n_estimators=300),
+    'RandomForest': RandomForestRegressor(n_estimators=100),
+    'DecisionTree': DecisionTreeRegressor(criterion='squared_error', max_depth=3, random_state=0)
+
+}
+
+# 訓練模型並取得特徵與預測資料（封裝）
+def analyze_stock(ticker):
+    end_date = datetime.today().strftime('%Y-%m-%d')
+    stock_data = yf.download(ticker, start="2020-01-01", end=end_date)
+    if stock_data.columns.nlevels > 1:
+        stock_data.columns = stock_data.columns.get_level_values(0)
+
+    close_series = stock_data['Close'].squeeze()
+    stock_data['MA_5'] = SMAIndicator(close=close_series, window=5).sma_indicator()
+    stock_data['MA_20'] = SMAIndicator(close=close_series, window=20).sma_indicator()
+    stock_data['RSI'] = RSIIndicator(close=close_series, window=14).rsi()
+    stock_data['MA_5_lag'] = stock_data['MA_5'].shift(1)
+    stock_data['MA_20_lag'] = stock_data['MA_20'].shift(1)
+    stock_data['RSI_lag'] = stock_data['RSI'].shift(1)
+    stock_data['Volume_lag'] = stock_data['Volume'].shift(1)
+    stock_data = stock_data.bfill()
+
+    stock_data['sentiment_lag'] = 0.0
+    X = stock_data[['sentiment_lag', 'Volume_lag', 'MA_5_lag', 'MA_20_lag', 'RSI_lag']]
+    y = stock_data['Close']
+    X = X.dropna()
+    y = y[X.index]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    models = {name: mdl.fit(X_train, y_train) for name, mdl in available_models.items()}
+    return stock_data, X, models
+
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    chart_html = generate_comparison_chart()
+    chart_html = ""
     summary_html = ""
-    for ticker, results in all_results.items():
-        best_model = max(results['model_scores'].items(), key=lambda x: x[1]['test_score'])
-        pred = results['predictions'][best_model[0]]
+    error_msg = ""
 
-        # 計算平均預測
-        preds = [p['predicted_price'] for p in results['predictions'].values()]
-        avg_pred = sum(preds) / len(preds)
-        avg_change = ((avg_pred - results['current_price']) / results['current_price']) * 100
+    if request.method == 'POST':
+        try:
+            retrain = request.form.get('retrain', '') == '1'
+            ticker = request.form.get('ticker', '').strip().upper()
+            n_days = int(request.form.get('days', 30))
+            model_choice = request.form.get('model', 'GradientBoosting')
 
-        summary_html += f"""
-        <h2>{ticker}</h2>
-        <ul>
-            <li>最新一筆價格: ${results['current_price']:.2f}</li>
-            <li>預測價格 ({best_model[0]}): ${pred['predicted_price']:.2f}</li>
-            <li>預期變化: {pred['change_percent']:+.2f}%</li>
-        </ul>
-        """
+            if not ticker:
+                error_msg = "請輸入股票代號。"
+            elif n_days <= 0:
+                error_msg = "預測天數必須為正整數。"
+            elif model_choice not in available_models:
+                error_msg = "模型選擇無效。"
+            else:
+                model_path = f"cache/model_{ticker}_{model_choice}.pkl"
+                feature_path = f"cache/X_latest_{ticker}.json"
 
-    html_template = """
+                if retrain:
+                    if os.path.exists(model_path):
+                        os.remove(model_path)
+                    if os.path.exists(feature_path):
+                        os.remove(feature_path)
+
+                stock_data, features_df, trained_models = analyze_stock(ticker)
+                model = trained_models[model_choice]
+                predicted_prices = predict_n_days(stock_data, features_df, model, n_days=n_days)
+
+                current_price = stock_data['Close'].iloc[-1]
+                mean_pred = np.mean(predicted_prices)
+                std_pred = np.std(predicted_prices)
+
+                past_prices = list(stock_data['Close'].iloc[-30:])
+                full_series = past_prices + predicted_prices
+                x_axis = list(range(1, len(full_series) + 1))
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=x_axis[:30], y=past_prices,
+                    mode='lines+markers', name='過去30天',
+                    hovertemplate='天數 %{x}<br>價格: %{y:.2f}'
+                ))
+                fig.add_trace(go.Scatter(
+                    x=x_axis[30:], y=predicted_prices,
+                    mode='lines+markers', name='預測價格',
+                    hovertemplate='天數 %{x}<br>預測: %{y:.2f}'
+                ))
+                fig.add_trace(go.Scatter(
+                    x=x_axis[30:], y=[p + 1.96 * std_pred for p in predicted_prices],
+                    mode='lines', name='95% 上限', line=dict(dash='dot', color='lightblue'),
+                    hovertemplate='天數 %{x}<br>上限: %{y:.2f}'
+                ))
+                fig.add_trace(go.Scatter(
+                    x=x_axis[30:], y=[p - 1.96 * std_pred for p in predicted_prices],
+                    mode='lines', name='95% 下限', line=dict(dash='dot', color='lightblue'),
+                    hovertemplate='天數 %{x}<br>下限: %{y:.2f}'
+                ))
+                fig.update_layout(
+                    title=f"{ticker} 過去30天與未來{n_days}天預測（含 95% 信心區間） ({model_choice})",
+                    xaxis_title="天數 (1=最舊, 共{}天)".format(len(full_series)),
+                    yaxis_title="價格 (USD)",
+                    yaxis=dict(range=[min(full_series)-3, max(full_series)+3])
+                )
+                chart_html = fig.to_html(full_html=False)
+
+                summary_html = f"""
+                <h3>📌 統計摘要</h3>
+                <ul>
+                    <li>使用模型：{model_choice}</li>
+                    <li>最新一筆價格：${current_price:.2f}</li>
+                    <li>平均預測價格：${mean_pred:.2f}</li>
+                    <li>預測變化：{((mean_pred - current_price) / current_price) * 100:+.2f}%</li>
+                    <li>標準差：±${std_pred:.2f}</li>
+                </ul>
+                """
+
+        except ValueError:
+            error_msg = "請輸入有效的股票代號。"
+        except Exception as e:
+            error_msg = f"處理過程發生錯誤：{e}"
+
+    html_template = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
-        <title>股票預測儀表板</title>
+        <title>動態股票預測儀表板</title>
         <style>
-            body {
-                font-family: 'Segoe UI', sans-serif;
-                background-color: #f0f2f5;
-                color: #333;
-                margin: 0;
-                padding: 0;
-            }
-            h1 {
-                background-color: #1f77b4;
-                color: white;
-                padding: 20px;
-                margin: 0;
-                text-align: center;
-            }
-            .container {
-                padding: 20px;
-                max-width: 1000px;
-                margin: auto;
-            }
-            .card {
-                background-color: white;
-                border-radius: 8px;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                margin-bottom: 20px;
-                padding: 20px;
-            }
-            ul {
-                list-style-type: none;
-                padding-left: 0;
-            }
-            li {
-                margin: 8px 0;
-            }
+            body {{ font-family: sans-serif; background-color: #f8f9fa; padding: 30px; }}
+            input, select, button {{ padding: 8px; margin: 5px; }}
+            label {{ font-weight: bold; }}
+            .error {{ color: red; font-weight: bold; }}
+            .note {{ background-color: #fff3cd; border-left: 6px solid #ffecb5; padding: 12px; margin-top: 20px; }}
         </style>
+        <script>
+        function toggleChart() {{
+            var box = document.getElementById('chartBox');
+            box.style.display = (box.style.display === 'none') ? 'block' : 'none';
+        }}
+        window.addEventListener('DOMContentLoaded', function() {{
+            document.querySelector('form').addEventListener('submit', function() {{
+                const loading = document.createElement('p');
+                loading.textContent = '🔄 預測中，請稍候...';
+                loading.style.color = 'blue';
+                this.appendChild(loading);
+            }});
+        }});
+        </script>
     </head>
     <body>
-        <h1>📈 股票預測儀表板</h1>
-        <div class="container">
-            {{ chart_html | safe }}
-            <hr>
-            {{ summary_html | safe }}
+        <h1>📈 股票預測儀表板（Flask + 多日預測）</h1>
+
+        <form method="POST">
+            <label>股票代號：</label>
+            <input type="text" name="ticker" required value="{request.form.get('ticker', '')}">
+            <label>預測天數：</label>
+            <input type="number" name="days" min="1" max="90" value="{request.form.get('days', 30)}">
+            <label>模型選擇：</label>
+            <select name="model">
+                <option value="GradientBoosting" {'selected' if request.form.get('model') == 'GradientBoosting' else ''}>Gradient Boosting</option>
+                <option value="RandomForest" {'selected' if request.form.get('model') == 'RandomForest' else ''}>Random Forest</option>
+                <option value="LinearRegression" {'selected' if request.form.get('model') == 'LinearRegression' else ''}>Linear Regression</option>
+                <option value="DecisionTree" {'selected' if request.form.get('model') == 'DecisionTree' else ''}>Decision Tree</option>
+            </select>
+            <button type="submit">開始預測</button>
+        </form>
+
+        <div class="note">
+            ⚠️ <strong>注意：</strong>本網頁使用「多日連續預測」，每次以前一日預測結果作為下一天的依據，屬於 multi-step forecast。<br>
+            終端機模式則僅預測隔日價格（單日單步預測），兩者預測邏輯不同，請勿直接比較。
+        </div>
+
+        <div class="error">{error_msg}</div>
+        <hr>
+
+        <button onclick="toggleChart()">🔍 顯示 / 隱藏 預測圖表</button>
+        <div id="chartBox" style="display: block;">
+            {{{{ chart_html | safe }}}}
+        </div>
+
+        <div>
+            {{{{ summary_html | safe }}}}
         </div>
     </body>
     </html>
     """
     return render_template_string(html_template, chart_html=chart_html, summary_html=summary_html)
-
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)
