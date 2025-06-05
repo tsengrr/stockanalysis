@@ -1,6 +1,6 @@
 # NVIDIA (NVDA) 股票價格預測
 
-本程式使用機器學習模型來預測 NVIDIA (NVDA) 股票的收盤價。該模型整合了技術指標（移動平均線、相對強弱指數等）及新聞情緒分析，並使用多種回歸模型來進行預測。
+本程式使用機器學習模型來預測 NVIDIA (NVDA)、Apple (AAPL)、Google (GOOGL)、Tesla (TSLA)、Microsoft (MSFT)、Amazon (AMZN)、Meta (META) 多支股票的收盤價。該模型整合了技術指標（移動平均線、相對強弱指數等）及新聞情緒分析，並使用多種回歸模型來進行預測。
 
 ## 功能特色
 - 透過 `yfinance` 獲取 NVDA 股票的歷史數據。
@@ -11,14 +11,15 @@
   - 梯度提升回歸 (Gradient Boosting Regressor)
   - 決策樹回歸 (Decision Tree Regressor)
   - 隨機森林回歸 (Random Forest Regressor)
-- 預測未來某日的收盤價格。
+- 預測未來連續 N 天（預設 30 天）的收盤價格。
+- 提供網頁介面，可即時輸入股票代號與預測天數。
 
 ## 安裝需求
 
 請確保您的環境已安裝 Python 及以下相依套件，可使用 pip 安裝：
 
 ```sh
-pip install yfinance feedparser pandas textblob scikit-learn ta
+pip install yfinance feedparser pandas textblob scikit-learn ta numpy plotly flask joblib
 ```
 
 ## 使用方式
@@ -26,6 +27,11 @@ pip install yfinance feedparser pandas textblob scikit-learn ta
 1. 執行程式，系統會自動下載 NVDA 股票歷史數據，計算技術指標，並收集新聞情緒。
 2. 訓練四種不同的機器學習回歸模型，並輸出各模型的準確度分數。
 3. 使用最新數據進行未來股價預測，並輸出預測結果。
+4. 然後於瀏覽器開啟：
+```
+http://localhost:80/
+```
+即可使用互動介面進行股票預測、模型切換與 n 日未來預測。
 
 ## 主要程式邏輯
 
@@ -68,5 +74,6 @@ Predicted Close Price using Random Forest: 730.12
 - 預測結果僅供參考，股市具有高度波動性，請謹慎操作。
 - 若 `feedparser` 無法成功擷取新聞，請檢查 RSS 來源是否變更。
 - 運行程式前，請確保 API 服務正常運作，避免數據擷取失敗。
-
+- 📌 **本網頁使用多步（multi-step）未來預測**，每日預測會依前一天預測結果迭代更新。
+- 📌 **終端機預測僅為單步預測（隔日）**，兩者預測邏輯不同，請勿直接比較。
 
